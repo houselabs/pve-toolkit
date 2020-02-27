@@ -7,7 +7,7 @@ printf "\n*** This script will download a cloud image and create a Proxmox VM te
 ### How to use:
 ### Pre-req:
 ### - run on a Proxmox 6 server
-### - a dhcp server should be active on vmbr0
+### - a dhcp server should be active on vmbr1
 ###
 ### - fork the gist and adapt the defaults as needed
 ### - download the script into /usr/local/bin/
@@ -33,18 +33,21 @@ printf "\n*** This script will download a cloud image and create a Proxmox VM te
 ### - most links will download the latest current (stable) version of the OS
 ### - older cloud-init versions do not support hashed passwords
 
-printf "* Available templates to generate:\n 2) debian9\n 3) debian10\n 4) ubuntu1804\n 5) centos7\n 6) coreos\n 7) arch\n 8) alpine310\n\n"
+printf "* Available templates to generate:\n 2) debian9\n 3) debian10\n 4) ubuntu1804\n 5) centos7\n 6) coreos\n 7) arch\n 8) alpine310\n 9) fedora coreos\n 10) openwrt19\n\n"
 read -p "* Enter number of distro to use: " OSNR
 
 # defaults which are used for most templates
 RESIZE=+30G
 MEMORY=2048
 BRIDGE=vmbr0
+ENABLE_CLOUD_INIT=true
 USERCONFIG_DEFAULT=none # cloud-init-config.yml
 CITYPE=nocloud
 SNIPPETSPATH=/var/lib/vz/snippets
 SSHKEY=~/.ssh/2019_id_rsa.pub # ~/.ssh/id_rsa.pub
+CONF_APPEND=""
 NOTE=""
+RENAME_FILE_EXTENSION=""
 
 case $OSNR in
 
@@ -108,6 +111,7 @@ case $OSNR in
     VMID=${VMID:-$VMID_DEFAULT}
     RESIZE=+24G
     VMIMAGE=coreos_production_qemu_image.img.bz2
+    RENAME_FILE_EXTENSION=qcow2
     CITYPE=configdrive2
     NOTE="\n## Default user is 'core'\n## NOTE: In CoreOS, setting a password via cloud-config does not seem to work!\n"
     printf "$NOTE\n"
@@ -138,6 +142,37 @@ case $OSNR in
     #cp -v /root/$VMIMAGE /tmp/ # for local testing
     ;;
 
+  9)
+    OSNAME=fedora-coreos
+    DOWNLOAD_URL=`curl -s https://builds.coreos.fedoraproject.org/streams/stable.json| jq --raw-output '.architectures.x86_64.artifacts.qemu.formats["qcow2.xz"].disk.location'`
+    VMID_DEFAULT=59000
+    read -p "Enter a VM ID for $OSNAME [$VMID_DEFAULT]: " VMID
+    VMID=${VMID:-$VMID_DEFAULT}
+    RESIZE=+24G
+    VMIMAGE=fedora-coreos-qemu.x86_64.qcow2.xz
+    CONF_APPEND="args: -fw_cfg name=opt/com.coreos/config,file=$SNIPPETSPATH/$VMID-$OSNAME.ign"
+    NOTE="\n## Default user is 'core'\n## NOTE: In CoreOS, setting a password via cloud-config does not seem to work!\n"
+    printf "$NOTE\n"
+    wget -O /tmp/$VMIMAGE -N $DOWNLOAD_URL
+    SSH_KEY_CONTENT=`cat $SSHKEY`
+    printf '{"ignition":{"config":{"replace":{"source":null,"verification":{}}},"security":{"tls":{}},"timeouts":{},"version":"3.0.0"},"passwd":{"users":[{"name":"core","sshAuthorizedKeys":["%s"]}]},"storage":{},"systemd":{}}' "$SSH_KEY_CONTENT" > $SNIPPETSPATH/$VMID-$OSNAME.ign
+    ;;
+
+  10)
+    OSNAME=openwrt19
+    VMID_DEFAULT=60000
+    RESIZE=0
+    MEMORY=512
+    ENABLE_CLOUD_INIT=false
+    read -p "Enter a VM ID for $OSNAME [$VMID_DEFAULT]: " VMID
+    VMID=${VMID:-$VMID_DEFAULT}
+    VMIMAGE=openwrt-19.07.1-x86-64-combined-ext4.img.gz
+    NOTE="\n## Default user is 'alpine'\n## NOTE: Cloud-init on Alpine is not yet able to apply network config.\n#  Also setting a password via cloud-config does not seem to work!\n"
+    printf "$NOTE\n"
+    wget -P /tmp -N https://downloads.openwrt.org/releases/19.07.1/targets/x86/64/$VMIMAGE
+    #cp -v /root/$VMIMAGE /tmp/ # for local testing
+    ;;
+
   *)
     printf "\n** Unknown OS number. Please use one of the above!\n"
     exit 0
@@ -149,9 +184,19 @@ esac
     && bzip2 -d --force /tmp/$VMIMAGE \
     && VMIMAGE=$(echo "${VMIMAGE%.*}") \
 
-[[ $VMIMAGE == *".img" ]] \
-    && mv /tmp/$VMIMAGE /tmp/$VMIMAGE.qcow2 \
-    && VMIMAGE=$VMIMAGE.qcow2
+[[ $VMIMAGE == *".xz" ]] \
+    && printf "\n** Uncompressing image (waiting to complete...)\n" \
+    && unxz -f /tmp/$VMIMAGE \
+    && VMIMAGE=$(echo "${VMIMAGE%.*}") \
+
+[[ $VMIMAGE == *".gz" ]] \
+    && printf "\n** Uncompressing image (waiting to complete...)\n" \
+    && gunzip -f /tmp/$VMIMAGE \
+    && VMIMAGE=$(echo "${VMIMAGE%.*}") \
+
+[[ ! -z "$RENAME_FILE_EXTENSION" ]] \
+    && mv /tmp/$VMIMAGE /tmp/$VMIMAGE.$RENAME_FILE_EXTENSION \
+    && VMIMAGE=$VMIMAGE.$RENAME_FILE_EXTENSION
 
 # TODO: could prompt for the VM name
 printf "\n** Creating a VM with $MEMORY MB using network bridge $BRIDGE\n"
@@ -166,53 +211,59 @@ qm set $VMID --scsihw virtio-scsi-pci --scsi0 local-lvm:vm-$VMID-disk-0
 printf "\n** Setting boot and display settings with serial console\n"
 qm set $VMID --boot c --bootdisk scsi0 --serial0 socket --vga serial0
 
-printf "\n** Using a dhcp server on $BRIDGE (or change to static IP)\n"
-qm set $VMID --ipconfig0 ip=dhcp
-#This would work in a bridged setup, but a routed setup requires a route to be added in the guest
-#qm set $VMID --ipconfig0 ip=10.10.10.222/24,gw=10.10.10.1
-
-printf "\n** Creating a cloudinit drive managed by Proxmox\n"
-qm set $VMID --ide2 local-lvm:cloudinit
-
-printf "\n** Specifying the cloud-init configuration format\n"
-qm set $VMID --citype $CITYPE
-
-printf "#** Made with create-cloud-template.sh - https://gist.github.com/chriswayg/43fbea910e024cbe608d7dcb12cb8466\n" >> /etc/pve/qemu-server/$VMID.conf
-
-## TODO: Also ask for a network configuration. Or create a config with routing for a static IP
-printf "\n*** The script can add a cloud-init configuration with users and SSH keys from a file in the current directory.\n"
-read -p "Supply the name of the cloud-init-config.yml (this will be skipped, if file not found) [$USERCONFIG_DEFAULT]: " USERCONFIG
-USERCONFIG=${USERCONFIG:-$USERCONFIG_DEFAULT}
-if [ -f $PWD/$USERCONFIG ]
+if [ "$ENABLE_CLOUD_INIT" = true ]
 then
-    # The cloud-init user config file overrides the user settings done elsewhere
-    printf "\n** Adding user configuration\n"
-    cp -v $PWD/$USERCONFIG $SNIPPETSPATH/$VMID-$OSNAME-$USERCONFIG
-    qm set $VMID --cicustom "user=local:snippets/$VMID-$OSNAME-$USERCONFIG"
-    printf "#* cloud-config: $VMID-$OSNAME-$USERCONFIG\n" >> /etc/pve/qemu-server/$VMID.conf
-else
-    # The SSH key should be supplied either in the cloud-init config file or here
-    printf "\n** Skipping config file, as none was found\n\n** Adding SSH key\n"
-    qm set $VMID --sshkey $SSHKEY
-    printf "\n"
-    read -p "Supply an optional password for the default user (press Enter for none): " PASSWORD
-    [ ! -z "$PASSWORD" ] \
-        && printf "\n** Adding the password to the config\n" \
-        && qm set $VMID --cipassword $PASSWORD \
-        && printf "#* a password has been set for the default user\n" >> /etc/pve/qemu-server/$VMID.conf
-    printf "#- cloud-config used: via Proxmox\n" >> /etc/pve/qemu-server/$VMID.conf
+    printf "\n** Using a dhcp server on $BRIDGE (or change to static IP)\n"
+    qm set $VMID --ipconfig0 ip=dhcp
+    #This would work in a bridged setup, but a routed setup requires a route to be added in the guest
+    #qm set $VMID --ipconfig0 ip=10.10.10.222/24,gw=10.10.10.1
+
+    printf "\n** Creating a cloudinit drive managed by Proxmox\n"
+    qm set $VMID --ide2 local-lvm:cloudinit
+
+    printf "\n** Specifying the cloud-init configuration format\n"
+    qm set $VMID --citype $CITYPE
+
+    printf "#** Made with create-cloud-template.sh - https://gist.github.com/chriswayg/43fbea910e024cbe608d7dcb12cb8466\n" >> /etc/pve/qemu-server/$VMID.conf
+    ## TODO: Also ask for a network configuration. Or create a config with routing for a static IP
+    printf "\n*** The script can add a cloud-init configuration with users and SSH keys from a file in the current directory.\n"
+    read -p "Supply the name of the cloud-init-config.yml (this will be skipped, if file not found) [$USERCONFIG_DEFAULT]: " USERCONFIG
+    USERCONFIG=${USERCONFIG:-$USERCONFIG_DEFAULT}
+    if [ -f $PWD/$USERCONFIG ]
+    then
+        # The cloud-init user config file overrides the user settings done elsewhere
+        printf "\n** Adding user configuration\n"
+        cp -v $PWD/$USERCONFIG $SNIPPETSPATH/$VMID-$OSNAME-$USERCONFIG
+        qm set $VMID --cicustom "user=local:snippets/$VMID-$OSNAME-$USERCONFIG"
+        printf "#* cloud-config: $VMID-$OSNAME-$USERCONFIG\n" >> /etc/pve/qemu-server/$VMID.conf
+    else
+        # The SSH key should be supplied either in the cloud-init config file or here
+        printf "\n** Skipping config file, as none was found\n\n** Adding SSH key\n"
+        qm set $VMID --sshkey $SSHKEY
+        printf "\n"
+        read -p "Supply an optional password for the default user (press Enter for none): " PASSWORD
+        [ ! -z "$PASSWORD" ] \
+            && printf "\n** Adding the password to the config\n" \
+            && qm set $VMID --cipassword $PASSWORD \
+            && printf "#* a password has been set for the default user\n" >> /etc/pve/qemu-server/$VMID.conf
+        printf "#- cloud-config used: via Proxmox\n" >> /etc/pve/qemu-server/$VMID.conf
+    fi
+
+    printf "\n*** The following cloud-init configuration for User and Network will be used ***\n\n"
+    qm cloudinit dump $VMID user
+    printf "\n------------------------------\n"
+    qm cloudinit dump $VMID network
 fi
+
+
+# append extra config
+printf "$CONF_APPEND\n" >> /etc/pve/qemu-server/$VMID.conf
 
 # The NOTE is added to the Summary section of the VM (TODO there seems to be no 'qm' command for this)
 printf "#$NOTE\n" >> /etc/pve/qemu-server/$VMID.conf
 
 printf "\n** Increasing the disk size\n"
 qm resize $VMID scsi0 $RESIZE
-
-printf "\n*** The following cloud-init configuration for User and Network will be used ***\n\n"
-qm cloudinit dump $VMID user
-printf "\n------------------------------\n"
-qm cloudinit dump $VMID network
 
 # convert the vm into a template (TODO make this optional)
 qm template $VMID
